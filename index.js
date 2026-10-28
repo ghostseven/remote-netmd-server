@@ -342,6 +342,11 @@ async function getFactory() {
         try {
             await device.stop();
         } catch (ex) {}
+        // CachedSectorBulkDownload reads its whole buffer (~2 MB) as a single bulk transfer. Unlike browsers'
+        // WebUSB, the usb package hands that to libusb in one piece, which hung on an MZ-N710. Read it in chunks.
+        const { netMd } = device;
+        const readBulkToArray = netMd.readBulkToArray.bind(netMd);
+        netMd.readBulkToArray = (length, chunksize, callback) => readBulkToArray(length, Math.min(chunksize ?? 0x10000, 0x10000), callback);
         const factory = await device.factory();
         const esm = await ExploitStateManager.create(device, factory, ConsoleLogger);
         factoryState = { factory, esm, atracDownloader: null, fasterTransferEnabled: false };
