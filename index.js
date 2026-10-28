@@ -26,15 +26,25 @@ import {
     DevicesIds,
     rewriteDiscGroups,
     prepareDownload,
-    EKBOpenSource,
     MDSession,
-    Wireformat
+    Wireformat,
+    DiscFormat,
+    DiscFlag,
+    upload as readTrackFromDevice,
+    formatToHiMD,
 } from 'netmd-js';
 import {
     Mutex
 } from 'async-mutex';
 
+// Web Minidisc Pro only talks to servers reporting this version.
+const PROTOCOL_VERSION = '1.0';
+// Bumped whenever endpoints are added. Clients announce theirs with `/?client=N`,
+// so capabilities that need newer client code are only offered to clients that have it.
+const API_REVISION = 2;
+
 // Compatibility methods. Do NOT use these unless absolutely necessary!!
+// These have to match Web Minidisc Pro's `src/services/interfaces/netmd.ts`.
 export function convertDiscToWMD(source){
     return {
         ...source,
@@ -72,9 +82,9 @@ export function convertTrackToWMD(source){
         ...source,
         duration: Math.ceil(source.duration / 512),
         encoding: ({
-            [Encoding.sp]: { codec: "SP" },
-            [Encoding.lp2]: { codec: "LP2" },
-            [Encoding.lp4]: { codec: "LP4" },
+            [Encoding.sp]: source.channel === 1 ? { codec: 'SPM', bitrate: 146 } : { codec: 'SPS', bitrate: 292 },
+            [Encoding.lp2]: { codec: 'AT3', bitrate: 132 },
+            [Encoding.lp4]: { codec: 'AT3', bitrate: 66 },
         })[source.encoding],
     });
 }
@@ -83,11 +93,7 @@ export function convertTrackToNJS(source){
     return {
         ...source,
         duration: source.duration * 512,
-        encoding: ({
-            "SP": Encoding.sp,
-            "LP2": Encoding.lp2,
-            "LP4": Encoding.lp4,
-        })[["SP", "LP2", "LP4"].includes(source.encoding.codec) ? source.encoding.codec : "SP"],
+        encoding: source.encoding.codec.startsWith('SP') ? Encoding.sp : source.encoding.bitrate === 132 ? Encoding.lp2 : Encoding.lp4,
     }
 }
 
@@ -102,12 +108,84 @@ function isSequential(numbers) {
     return true;
 }
 
+// Port of Web Minidisc Pro's `recomputeGroupsAfterTrackMove` (src/utils.ts).
+// Pass -1 as `targetIndex` when deleting a track.
+function recomputeGroupsAfterTrackMove(disc, trackIndex, targetIndex) {
+    let offset = trackIndex > targetIndex ? 1 : -1;
+    const deleteMode = targetIndex === -1;
+
+    if (deleteMode) {
+        offset = -1;
+        targetIndex = disc.trackCount;
+    }
+
+    const boundsStart = Math.min(trackIndex, targetIndex);
+    const boundsEnd = Math.max(trackIndex, targetIndex);
+
+    const allTracks = disc.groups
+        .map(n => n.tracks)
+        .reduce((a, b) => a.concat(b), [])
+        .sort((a, b) => a.index - b.index)
+        .filter(n => !deleteMode || n.index !== trackIndex);
+
+    const groupBoundaries = disc.groups
+        .filter(n => n.title !== null)
+        .map(group => ({
+            name: group.title,
+            fullWidthName: group.fullWidthTitle,
+            start: group.tracks[0].index,
+            end: group.tracks[0].index + group.tracks.length - 1,
+        })); // Convert to a format better for shifting
+
+    let anyChanges = false;
+
+    for (const group of groupBoundaries) {
+        if (group.start > boundsStart && group.start <= boundsEnd) {
+            group.start += offset;
+            anyChanges = true;
+        }
+        if (group.end >= boundsStart && group.end < boundsEnd) {
+            group.end += offset;
+            anyChanges = true;
+        }
+    }
+
+    if (!anyChanges) return disc;
+
+    const newDisc = { ...disc };
+
+    // Convert back
+    newDisc.groups = groupBoundaries
+        .map(n => ({
+            title: n.name,
+            fullWidthTitle: n.fullWidthName,
+            index: n.start,
+            tracks: allTracks.slice(n.start, n.end + 1),
+        }))
+        .filter(n => n.tracks.length > 0);
+
+    // Convert ungrouped tracks
+    const allGrouped = newDisc.groups.map(n => n.tracks).reduce((a, b) => a.concat(b), []);
+    const ungrouped = allTracks.filter(n => !allGrouped.includes(n));
+
+    // Fix all the track indexes
+    if (deleteMode) {
+        for (let i = 0; i < allTracks.length; i++) {
+            allTracks[i].index = i;
+        }
+    }
+
+    if (ungrouped.length) newDisc.groups.unshift({ title: null, fullWidthTitle: null, index: 0, tracks: ungrouped });
+
+    return newDisc;
+}
+
 const webusb = new WebUSB({
     allowedDevices: DevicesIds.map(({
         deviceId,
         vendorId
     }) => ({
-        deviceId,
+        productId: deviceId,
         vendorId
     })),
     deviceTimeout: 1000000,
@@ -124,11 +202,12 @@ const netmdLogger = {
 
 let awaitingDeviceLockMutexRelease = null;
 let device = null;
+// The disc's contents, already converted to Web Minidisc Pro's format
 let cachedContent = undefined;
 
 async function getCachedContent() {
-    if (!cachedContent) cachedContent = await listContent(device);
-    return cachedContent;
+    if (!cachedContent) cachedContent = convertDiscToWMD(await listContent(device));
+    return JSON.parse(JSON.stringify(cachedContent));
 }
 
 function flushCache() {
@@ -141,19 +220,22 @@ function sleep(ms) {
     });
 }
 
+function errorMessage(error) {
+    return error instanceof Error ? error.message : String(error);
+}
 
 function fail(res, error) {
     try {
         res.json({
             ok: false,
-            error
+            error: errorMessage(error),
         });
     } catch (err) {}
 }
 
 function success(res, value) {
     try {
-        res.json(value ? {
+        res.json(value !== undefined ? {
             ok: true,
             value
         } : {
@@ -162,20 +244,58 @@ function success(res, value) {
     } catch (err) {}
 }
 
-async function awaitPromiseReturnStatus(promise, res) {
-    try{
-        success(res, await promise);
-    }catch(ex){
-        fail(res, ex);
-    }
+// Wraps a request handler, so that its result (or error) is always sent back to the client.
+function handle(handler) {
+    return async (req, res) => {
+        try {
+            success(res, await handler(req.query, req.body ?? {}));
+        } catch (ex) {
+            console.log(`Error while handling ${req.path}: ${errorMessage(ex)}`);
+            fail(res, ex);
+        }
+    };
 }
 
-function assertPresent(res, value) {
-    if ((isNaN(value) && (typeof value === 'number')) || value === undefined || value === null) {
-        fail(res, "Missing parameter.");
-        return false;
+function intParameter(parameters, name) {
+    const value = parseInt(parameters[name]);
+    if (isNaN(value)) throw new Error(`Missing parameter: ${name}`);
+    return value;
+}
+
+function stringParameter(parameters, name) {
+    const value = parameters[name];
+    if (value === undefined || value === null) throw new Error(`Missing parameter: ${name}`);
+    return String(value);
+}
+
+async function getCapabilities(clientRevision) {
+    // Mirrors NetMDUSBService.getServiceCapabilities() in Web Minidisc Pro.
+    // Factory mode isn't available over the network.
+    const capabilities = ['contentList', 'playbackControl', 'fullWidthSupport'];
+    const isSony = device.netMd.getVendor() === 0x54c;
+    const newClient = clientRevision >= 2;
+
+    if (newClient && isSony && device.netMd.getProduct() === 0x0286) {
+        // MZ-RH1
+        capabilities.push('trackDownload');
     }
-    return true;
+    if (isSony && await device.canEjectDisc()) {
+        capabilities.push('discEject');
+    }
+    const deviceName = device.netMd.getDeviceName();
+    if (newClient && (deviceName.includes("MZ-RH") || deviceName.includes("MZ-NH") || deviceName.includes("CMT-AH10"))) {
+        capabilities.push('himdFormat');
+    }
+    if (newClient && device.netMd.getDeviceFlags()?.nativeMonoUpload) {
+        capabilities.push('nativeMonoUpload');
+    }
+    try {
+        const flags = await device.getDiscFlags();
+        if ((flags & DiscFlag.writeProtected) === 0) {
+            capabilities.push('trackUpload', 'metadataEdit');
+        }
+    } catch (err) {}
+    return capabilities;
 }
 
 async function main() {
@@ -217,32 +337,12 @@ async function main() {
         cert: fs.readFileSync(httpsCert),
     }, app) : http.createServer(app);
     expressWs(app, server);
-    app.use(express.json());
+    app.use(express.json({ limit: '10mb' }));
 
-    // Make sure there is no way to call two methods at the same time.
     app.use((req, res, next) => {
         res.set("Access-Control-Allow-Origin", "*");
         res.set("Access-Control-Allow-Headers", "Content-Type");
-        if (awaitingDeviceLockMutexRelease) {
-            fail(res, "Not ready.");
-            return;
-        }
-        console.log(`Called ${req.url}`);
-        if (!req.url.includes("upload"))
-            mutex.acquire().then(release => {
-                res.on('finish', release);
-                res.on('error', (e) => {
-                    console.log(`Error while handling: ${e}.`);
-                    release();
-                });
-                res.on('close', release);
-                next();
-            }).catch(ex => console.log(ex));
-        else next();
-    });
-
-    // Fliter out preflight requests
-    app.use((req, res, next) => {
+        // Fliter out preflight requests
         if(req.method === "OPTIONS"){
             console.log(`Preflight request to ${req.url}`);
             if(req.header("Access-Control-Request-Private-Network") === "true"){
@@ -252,6 +352,36 @@ async function main() {
             return;
         }
         next();
+    });
+
+    // Make sure there is no way to call two methods at the same time.
+    app.use((req, res, next) => {
+        if (awaitingDeviceLockMutexRelease || !device) {
+            fail(res, "Not ready.");
+            return;
+        }
+        console.log(`Called ${req.url}`);
+        // The WebSocket endpoints take the lock themselves, for as long as the transfer runs
+        if (req.path.startsWith("/upload") || req.path.startsWith("/download")) {
+            next();
+            return;
+        }
+        mutex.acquire().then(release => {
+            let released = false;
+            const releaseOnce = () => {
+                if (!released) {
+                    released = true;
+                    release();
+                }
+            };
+            res.on('finish', releaseOnce);
+            res.on('error', (e) => {
+                console.log(`Error while handling: ${e}.`);
+                releaseOnce();
+            });
+            res.on('close', releaseOnce);
+            next();
+        }).catch(ex => console.log(ex));
     });
 
     setup(app);
@@ -264,8 +394,8 @@ async function main() {
                 if (device !== null) {
                     awaitingDeviceLockMutexRelease();
                     awaitingDeviceLockMutexRelease = null;
-                    console.log("New device connected! Application resumed.");
-                    cachedContent = null;
+                    console.log(`Connected to ${device.netMd.getDeviceName()}. Application resumed.`);
+                    flushCache();
                 }
             }
         }catch(ex){
@@ -301,86 +431,88 @@ async function main() {
 }
 main();
 
+// Runs `handler` for a WebSocket transfer while holding the device lock.
+// The lock is released and the socket closed when the handler finishes or fails.
+function withLockedWebSocket(ws, handler) {
+    mutex.acquire().then(async release => {
+        let finished = false;
+        const finish = () => {
+            if (finished) return;
+            finished = true;
+            release();
+        };
+        ws.on('close', finish);
+        ws.on('error', finish);
+        try {
+            await handler();
+        } catch (ex) {
+            console.log(ex);
+            try {
+                ws.send(JSON.stringify({ error: errorMessage(ex) }));
+                ws.close();
+            } catch (err) {}
+        }
+        finish();
+    }).catch(e => console.log(e));
+}
+
 function setup(app) {
     // ********************* NetMD <==> REST bridge **********************
     // Basic pages:
-    app.get("/", (req, res) => {
-        success(res, {
-            device: device.netMd.getDeviceName(),
-            capabilities: ['contentList', 'playbackControl', 'metadataEdit', 'trackUpload'],
-            version: '1.0',
-        });
-    });
+    app.get("/", handle(async ({ client }) => ({
+        device: device.netMd.getDeviceName(),
+        capabilities: await getCapabilities(parseInt(client) || 1),
+        version: PROTOCOL_VERSION,
+        apiRevision: API_REVISION,
+    })));
 
-    app.get('/deviceStatus', async (req, res) => {
+    app.get('/deviceStatus', handle(async () => {
         const devStat = await getDeviceStatus(device);
         if(!devStat.discPresent) flushCache();
-        success(res, devStat);
-    });
+        return devStat;
+    }));
 
     // The 'contentList' capability:
 
-    app.get('/listContent', (req, res) => {
-        if(req.query.flushCache){
-            flushCache();
-        }
-        awaitPromiseReturnStatus(new Promise(async (res, rej) => {
-            try{
-                const content = await getCachedContent();
-                return res(convertDiscToWMD(content));
-            }catch(ex){
-                rej(ex);
-            }
-        }), res);
-    });
+    app.get('/listContent', handle(async ({ flushCache: dropCache }) => {
+        if (dropCache === 'true') flushCache();
+        return await getCachedContent();
+    }));
 
-    app.get('/deviceName', (req, res) => {
-        success(res, device.netMd.getDeviceName());
-    });
+    app.get('/deviceName', handle(async () => device.netMd.getDeviceName()));
+
+    app.get('/finalize', handle(async () => {
+        await device.netMd.finalize();
+        flushCache();
+    }));
 
     // The 'metadataEdit' capability:
 
-    app.get('/renameTrack', async (req, res) => {
-        let {
-            index,
-            title,
-            fullWidthTitle
-        } = req.query;
+    app.get('/renameTrack', handle(async (parameters) => {
+        const index = intParameter(parameters, 'index');
+        const title = sanitizeHalfWidthTitle(stringParameter(parameters, 'title'));
+        const { fullWidthTitle } = parameters;
 
-        index = parseInt(index);
-        if (!assertPresent(res, title) || !assertPresent(res, index)) return;
-
-        await device.setTrackTitle(index, title, false);
+        await device.setTrackTitle(index, title);
         if (fullWidthTitle !== undefined) {
-            await device.setTrackTitle(index, fullWidthTitle, true);
+            await device.setTrackTitle(index, sanitizeFullWidthTitle(fullWidthTitle), true);
         }
         flushCache();
-        success(res);
-    });
+    }));
 
-    app.get('/renameDisc', (req, res) => {
-        let {
-            title,
-            fullWidthTitle
-        } = req.query;
-        if (!fullWidthTitle) fullWidthTitle = '';
-        if (!assertPresent(res, title)) return;
+    app.get('/renameDisc', handle(async (parameters) => {
+        const title = stringParameter(parameters, 'title');
+        await renameDisc(device, title, parameters.fullWidthTitle);
         flushCache();
-        awaitPromiseReturnStatus(renameDisc(device, title, fullWidthTitle), res);
-    });
+    }));
 
-    app.get('/renameGroup', async (req, res) => {
-        let {
-            groupIndex,
-            title,
-            fullWidthTitle
-        } = req.query;
-        if (!fullWidthTitle) fullWidthTitle = '';
-        groupIndex = parseInt(groupIndex);
-        if (!assertPresent(res, groupIndex) || !assertPresent(res, title)) return;
+    app.get('/renameGroup', handle(async (parameters) => {
+        const groupIndex = intParameter(parameters, 'groupIndex');
+        const title = stringParameter(parameters, 'title');
+        const { fullWidthTitle } = parameters;
 
         const disc = await getCachedContent();
-        let thisGroup = disc.groups.find(g => g.index === groupIndex);
+        const thisGroup = disc.groups.find(g => g.index === groupIndex);
         if (!thisGroup) {
             return;
         }
@@ -389,32 +521,25 @@ function setup(app) {
         if (fullWidthTitle !== undefined) {
             thisGroup.fullWidthTitle = fullWidthTitle;
         }
-        awaitPromiseReturnStatus(rewriteDiscGroups(device, disc), res);
         flushCache();
-    });
+        await rewriteDiscGroups(device, convertDiscToNJS(disc));
+    }));
 
-    app.get('/addGroup', async (req, res) => {
-        let {
-            groupBegin,
-            groupLength,
-            title
-        } = req.query;
+    app.get('/addGroup', handle(async (parameters) => {
+        const groupBegin = intParameter(parameters, 'groupBegin');
+        const groupLength = intParameter(parameters, 'groupLength');
+        const title = stringParameter(parameters, 'title');
+        const fullWidthTitle = parameters.fullWidthTitle ?? '';
         const disc = await getCachedContent();
 
-        groupBegin = parseInt(groupBegin);
-        groupLength = parseInt(groupLength);
-
-        if (!assertPresent(res, groupBegin) || !assertPresent(res, groupLength)) return;
-
-        let ungrouped = disc.groups.find(n => n.title === null);
+        const ungrouped = disc.groups.find(n => n.title === null);
         if (!ungrouped) {
-            fail(res, "No groupable tracks on the disc.");
-            return; // You can only group tracks that aren't already in a different group, if there's no such tracks, there's no point to continue
+            throw new Error("No groupable tracks on the disc."); // You can only group tracks that aren't already in a different group
         }
 
-        let ungroupedLengthBeforeGroup = ungrouped.tracks.length;
+        const ungroupedLengthBeforeGroup = ungrouped.tracks.length;
 
-        let thisGroupTracks = ungrouped.tracks.filter(n => n.index >= groupBegin && n.index < groupBegin + groupLength);
+        const thisGroupTracks = ungrouped.tracks.filter(n => n.index >= groupBegin && n.index < groupBegin + groupLength);
         ungrouped.tracks = ungrouped.tracks.filter(n => !thisGroupTracks.includes(n));
 
         if (ungroupedLengthBeforeGroup - ungrouped.tracks.length !== groupLength) {
@@ -427,210 +552,236 @@ function setup(app) {
 
         disc.groups.push({
             title,
-            fullWidthTitle: '',
+            fullWidthTitle,
             index: disc.groups.length,
             tracks: thisGroupTracks,
         });
         disc.groups = disc.groups.filter(g => g.tracks.length !== 0).sort((a, b) => a.tracks[0].index - b.tracks[0].index);
         flushCache();
-        awaitPromiseReturnStatus(rewriteDiscGroups(device, disc), res);
-    });
+        await rewriteDiscGroups(device, convertDiscToNJS(disc));
+    }));
 
-    app.get('/deleteGroup', async (req, res) => {
-        let {
-            index
-        } = req.query;
-        index = parseInt(index);
-        if (!assertPresent(res, index)) return;
-
+    app.get('/deleteGroup', handle(async (parameters) => {
+        const index = intParameter(parameters, 'index');
         const disc = await getCachedContent();
 
-        let groupIndex = disc.groups.findIndex(g => g.index === index);
+        // The group's tracks become ungrouped
+        let ungroupedGroup = disc.groups.find(g => g.title === null);
+        if (!ungroupedGroup) {
+            ungroupedGroup = {
+                index: -1,
+                title: null,
+                fullWidthTitle: null,
+                tracks: [],
+            };
+            disc.groups.unshift(ungroupedGroup);
+        }
+        const groupIndex = disc.groups.findIndex(g => g.index === index);
         if (groupIndex >= 0) {
-            disc.groups.splice(groupIndex, 1);
+            const deleted = disc.groups.splice(groupIndex, 1)[0];
+            ungroupedGroup.tracks = ungroupedGroup.tracks.concat(deleted.tracks);
+            ungroupedGroup.tracks.sort((a, b) => a.index - b.index);
         }
         flushCache();
-        awaitPromiseReturnStatus(rewriteDiscGroups(device, disc), res);
-    });
+        await rewriteDiscGroups(device, convertDiscToNJS(disc));
+    }));
 
-    app.post('/rewriteGroups', async (req, res) => {
-        if (!assertPresent(res, req.body.groups));
-        awaitPromiseReturnStatus(rewriteDiscGroups(device, {
-            ...getCachedContent(),
-            groups: req.body.groups.map(convertGroupToNJS)
-        }), res);
+    app.post('/rewriteGroups', handle(async (_, body) => {
+        if (!Array.isArray(body.groups)) throw new Error("Missing parameter: groups");
+        const disc = await getCachedContent();
+        disc.groups = body.groups;
         flushCache();
-    });
+        await rewriteDiscGroups(device, convertDiscToNJS(disc));
+    }));
 
-    app.post('/deleteTracks', async (req, res) => {
-        if (!assertPresent(res, req.body.indexes) || !assertPresent(res, Array.isArray(req.body.indexes))) return;
-        let indexes = req.body.indexes;
-        for (let i = 0; i < indexes.length; i++) {
-            indexes[i] = parseInt(indexes[i]);
-            if (!assertPresent(res, indexes[i])) return;
-        }
-        indexes = indexes.sort();
-        indexes.reverse();
+    app.post('/deleteTracks', handle(async (_, body) => {
+        if (!Array.isArray(body.indexes)) throw new Error("Missing parameter: indexes");
+        const indexes = body.indexes.map((_, i) => intParameter(body.indexes, i));
+        indexes.sort((a, b) => b - a);
         let content = await getCachedContent();
-        for (let index of indexes) {
-            //content = recomputeGroupsAfterTrackMove(content, index, -1);
+        flushCache();
+        for (const index of indexes) {
+            // Attempt to get panasonics working correctly (MyNameIsX)
+            await device.getTrackTitle(index, false);
+            await device.getTrackCount();
+            content = recomputeGroupsAfterTrackMove(content, index, -1);
             await device.eraseTrack(index);
             await sleep(100);
         }
+        await rewriteDiscGroups(device, convertDiscToNJS(content));
+    }));
+
+    app.get('/moveTrack', handle(async (parameters) => {
+        const src = intParameter(parameters, 'src');
+        const dst = intParameter(parameters, 'dst');
+        const updateGroups = parameters.updateGroups !== 'false';
+
+        const content = await getCachedContent();
         flushCache();
-        awaitPromiseReturnStatus(rewriteDiscGroups(device, content), res);
-    });
+        await device.moveTrack(src, dst);
+        if (updateGroups) {
+            await rewriteDiscGroups(device, convertDiscToNJS(recomputeGroupsAfterTrackMove(content, src, dst)));
+        }
+    }));
 
-    app.get('/moveTrack', async (req, res) => {
-        let {
-            src,
-            dst
-        } = req.query;
-
-        src = parseInt(src);
-        dst = parseInt(dst);
-
-        if (!assertPresent(res, src) || !assertPresent(res, src)) return;
+    app.get('/wipeDisc', handle(async () => {
+        try {
+            await device.stop();
+        } catch (ex) {}
         flushCache();
-        awaitPromiseReturnStatus(device.moveTrack(src, dst), res);
-    });
+        await device.eraseDisc();
+    }));
 
-    app.get('/wipeDisc', (req, res) => {
+    app.get('/wipeDiscTitleInfo', handle(async () => {
         flushCache();
-        awaitPromiseReturnStatus(device.eraseDisc(), res);
-    });
+        await device.setDiscTitle('');
+        await device.setDiscTitle('', true);
+    }));
+
+    app.get('/formatToHiMD', handle(async () => {
+        flushCache();
+        await formatToHiMD(device);
+    }));
+
+    // The 'discEject' capability:
+
+    app.get('/eject', handle(async () => {
+        flushCache();
+        await device.ejectDisc();
+    }));
 
     // The 'playbackControl' capability:
 
-    app.get('/play', (req, res) => awaitPromiseReturnStatus(device.play(), res));
-    app.get('/pause', (req, res) => awaitPromiseReturnStatus(device.pause(), res));
-    app.get('/stop', (req, res) => awaitPromiseReturnStatus(device.stop(), res));
-    app.get('/next', (req, res) => awaitPromiseReturnStatus(device.nextTrack(), res));
-    app.get('/prev', (req, res) => awaitPromiseReturnStatus(device.previousTrack(), res));
-    app.get('/goto', (req, res) => {
-        let {
-            index
-        } = req.query;
-        index = parseInt(index);
-        if (!assertPresent(res, index)) return;
-        awaitPromiseReturnStatus(device.gotoTrack(index), res);
-    });
-    app.get('/gotoTime', (req, res) => {
-        let {
-            index,
-            hour,
-            minute,
-            second,
-            frame
-        } = req.query;
-        index = parseInt(index);
-        hour = parseInt(hour);
-        minute = parseInt(minute);
-        second = parseInt(second);
-        frame = parseInt(frame);
-        if (!assertPresent(res, index) || !assertPresent(res, hour) || !assertPresent(res, minute) || !assertPresent(res, second) || !assertPresent(res, frame)) return;
-        awaitPromiseReturnStatus(device.gotoTime(track, hour, minute, second, frame));
-    });
-    app.get('/getPosition', (req, res) => awaitPromiseReturnStatus(device.getPosition(), res));
+    app.get('/play', handle(() => device.play()));
+    app.get('/pause', handle(() => device.pause()));
+    app.get('/stop', handle(() => device.stop()));
+    app.get('/next', handle(() => device.nextTrack()));
+    app.get('/prev', handle(() => device.previousTrack()));
+    app.get('/goto', handle((parameters) => device.gotoTrack(intParameter(parameters, 'index'))));
+    app.get('/gotoTime', handle((parameters) => device.gotoTime(
+        intParameter(parameters, 'index'),
+        intParameter(parameters, 'hour'),
+        intParameter(parameters, 'minute'),
+        intParameter(parameters, 'second'),
+        intParameter(parameters, 'frame'),
+    )));
+    app.get('/getPosition', handle(() => device.getPosition()));
+
+    // The 'trackUpload' capability:
+
     let session = null;
-    app.get('/prepareUpload', async (req, res) => {
+    app.get('/prepareUpload', handle(async () => {
         await prepareDownload(device);
-        session = new MDSession(device, new EKBOpenSource());
+        session = new MDSession(device);
         await session.init();
-        success(res);
-    });
-    app.get('/finalizeUpload', async (req, res) => {
-        await session.close();
-        await device.release();
+    }));
+    app.get('/finalizeUpload', handle(async () => {
+        if (session) {
+            await session.close();
+            await device.release();
+        }
         session = null;
         flushCache();
-        success(res);
-    });
+    }));
 
     app.ws('/upload', (ws, req) => {
         if(!session){
             console.log("You need to call /prepareUpload first");
+            ws.send(JSON.stringify({ error: "The upload session hasn't been prepared." }));
             ws.close();
+            return;
         }
-        mutex.acquire().then(async release => {
-            let {
-                title,
-                fullWidthTitle,
-                format,
-                totalLength,
-                chunked
-            } = req.query;
-            if (!fullWidthTitle) fullWidthTitle = '';
-            if (title === undefined || title === null || format === undefined || format === null) ws.close();
-            const WireformatDict = {
-                SP: Wireformat.pcm,
-                LP2: Wireformat.lp2,
-                LP105: Wireformat.l105kbps,
-                LP4: Wireformat.lp4,
-            };
-            format = WireformatDict[format];
+        let {
+            title,
+            fullWidthTitle,
+            format: codec,
+            totalLength,
+        } = req.query;
+        if (!fullWidthTitle) fullWidthTitle = '';
+        const WireformatDict = {
+            SP: Wireformat.pcm,
+            SPM: Wireformat.pcm,
+            LP2: Wireformat.lp2,
+            LP105: Wireformat.l105kbps,
+            LP4: Wireformat.lp4,
+        };
+        const format = WireformatDict[codec];
+        if (title === undefined || title === null || format === undefined) {
+            ws.send(JSON.stringify({ error: "Invalid upload parameters." }));
+            ws.close();
+            return;
+        }
 
-            let written = 0;
+        // Encrypted packets are collected first, so the device isn't kept waiting on the network mid-transfer.
+        const queue = [];
+        let resolveAllReceived;
+        const allReceived = new Promise(res => resolveAllReceived = res);
+        ws.on('message', _piece => {
+            // Deserialize data
+            const piece = new Uint8Array(_piece);
+            const type = piece[0];
+            if(type === 0){
+                const iv = piece.subarray(1, 9);
+                const key = piece.subarray(9, 17);
+                const data = piece.subarray(17);
+                queue.push({ iv, key, data });
+            }else{
+                resolveAllReceived();
+            }
+        });
+
+        withLockedWebSocket(ws, async () => {
+            ws.send(JSON.stringify({ init: true }));
+            await allReceived;
+            console.log(`Received ${queue.length} packets. Expecting ${totalLength} bytes got ${queue.reduce((a, b) => a + b.data.length, 0)}`);
 
             let lastTime = 0;
-
-            function updateProgress() {
-                let newTime = new Date().getTime();
+            const mdTrack = new MDTrack(sanitizeHalfWidthTitle(title), format, {
+                byteLength: parseInt(totalLength),
+            }, 0x400, sanitizeFullWidthTitle(fullWidthTitle), () => ({
+                async *[Symbol.asyncIterator](){
+                    for(let e of queue){
+                        yield e;
+                    }
+                }
+            }));
+            await session.downloadTrack(mdTrack, ({
+                writtenBytes
+            }) => {
+                const newTime = new Date().getTime();
                 if(newTime - lastTime > 100){
-                    ws.send(JSON.stringify({
-                        written
-                    }));
+                    ws.send(JSON.stringify({ written: writtenBytes }));
                     lastTime = newTime;
                 }
-            }
+            }, codec === 'SPM' ? DiscFormat.spMono : undefined);
 
-            let halfWidthTitle = sanitizeHalfWidthTitle(title);
-            fullWidthTitle = sanitizeFullWidthTitle(fullWidthTitle);
-
-            let queue = [];
-
-            ws.on('message', async _piece => {
-                // Deserialize data
-                try{
-                    const piece = new Uint8Array(_piece);
-                    const type = piece[0];
-                    if(type === 0){
-                        const iv = piece.subarray(1, 9);
-                        const key = piece.subarray(9, 17);
-                        const data = piece.subarray(17);
-                        queue.push({ iv, key, data });
-                    }else{
-                        console.log(`As of the start of upload, received ${queue.length} packets. Expecting ${totalLength} bytes got ${queue.reduce((a, b) => a + b.data.length, 0)}`);
-                        let mdTrack = new MDTrack(halfWidthTitle, format, {
-                            byteLength: parseInt(totalLength),
-                        }, 0x400, fullWidthTitle, () => ({
-                            async *[Symbol.asyncIterator](){
-                                for(let e of queue){
-                                    yield e;
-                                }
-                            }
-                        }));
-                        await session.downloadTrack(mdTrack, ({
-                            writtenBytes
-                        }) => {
-                            written = writtenBytes;
-                            updateProgress();
-                        });
-
-                        flushCache();
-                        ws.send(JSON.stringify({ terminate: true }));
-                        console.log("Upload completed.");
-                        release();
-
-                    }
-                }catch(ex){
-                    console.log(ex);
-                }
-            });
-
-            ws.send(JSON.stringify({ init: true }));
-        }).catch(e => console.log(e));
+            flushCache();
+            ws.send(JSON.stringify({ terminate: true }));
+            console.log("Upload completed.");
+        });
     });
 
-    app.get('/upload', (res, req) => fail(req, "This is a WebSocket-only endpoint."));
+    // The 'trackDownload' capability (MZ-RH1 only):
+
+    app.ws('/download', (ws, req) => {
+        withLockedWebSocket(ws, async () => {
+            const index = intParameter(req.query, 'index');
+            let lastTime = 0;
+            const [format, data] = await readTrackFromDevice(device, index, ({ readBytes, totalBytes }) => {
+                const newTime = new Date().getTime();
+                if(newTime - lastTime > 100){
+                    ws.send(JSON.stringify({ read: readBytes, total: totalBytes }));
+                    lastTime = newTime;
+                }
+            });
+            const extension = format === DiscFormat.spMono || format === DiscFormat.spStereo ? 'aea' : 'wav';
+            // The file follows as a single binary message
+            ws.send(JSON.stringify({ extension, length: data.byteLength }));
+            ws.send(data);
+            console.log("Download completed.");
+        });
+    });
+
+    app.get('/upload', handle(() => { throw new Error("This is a WebSocket-only endpoint."); }));
+    app.get('/download', handle(() => { throw new Error("This is a WebSocket-only endpoint."); }));
 }

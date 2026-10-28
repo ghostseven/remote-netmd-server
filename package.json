@@ -1,20 +1,23 @@
 {
   "name": "netmd-serv",
-  "version": "0.1.0",
-  "description": "NetMD recorder server",
+  "version": "0.2.0",
+  "description": "Remote NetMD server for Web MiniDisc Pro",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node index.js"
   },
   "author": "asivery",
   "license": "GPL v2",
   "type": "module",
   "dependencies": {
-    "async-mutex": "^0.3.2",
-    "express": "^4.17.1",
+    "async-mutex": "^0.5.0",
+    "express": "^4.21.2",
     "express-ws": "^5.0.2",
-    "netmd-js": "file:../netmd-js-workingtree",
-    "usb": "^2.7.0",
-    "yargs": "^17.3.1"
+    "netmd-js": "^4.4.1",
+    "usb": "^2.14.0",
+    "yargs": "^17.7.2"
+  },
+  "engines": {
+    "node": ">=20"
   }
 }
