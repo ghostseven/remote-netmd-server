@@ -47,6 +47,6 @@ Then run `sudo systemctl enable --now remote-netmd`.
 - Ejecting the disc, on devices which support it
 - Downloading tracks (MZ-RH1 only), formatting discs to Hi-MD (on Hi-MD units), finalizing the disc
 
-Factory (homebrew) mode features aren't available over the network.
+- The homebrew (factory) mode on Sony and Aiwa portables: ToC editing, ripping tracks with the exploits, SP and mono SP uploads of ATRAC files, firmware and RAM dumps, and the other homebrew features. The exploits run on the server.
 
-Downloading tracks, mono SP uploads, finalizing, wiping the titles and formatting need a version of Web Minidisc Pro which supports Remote NetMD API revision 2. Older versions keep working, but don't offer these features.
+Downloading tracks, mono SP uploads, finalizing, wiping the titles and formatting need a version of Web Minidisc Pro which supports Remote NetMD API revision 2. The homebrew mode needs revision 3. Older versions keep working, but don't offer these features.

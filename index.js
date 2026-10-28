@@ -9,6 +9,8 @@ import {
 } from 'usb';
 import yargs from 'yargs';
 import fs from 'fs';
+import { createRequire } from 'module';
+import { Worker } from 'worker_threads';
 import {
     hideBin
 } from 'yargs/helpers';
@@ -32,7 +34,30 @@ import {
     DiscFlag,
     upload as readTrackFromDevice,
     formatToHiMD,
+    readUTOCSector,
+    writeUTOCSector,
+    getDescriptiveDeviceCode,
+    cleanRead,
+    MemoryType,
 } from 'netmd-js';
+import { makeGetAsyncPacketIteratorOnWorkerThread } from 'netmd-js/dist/node-encrypt-worker.js';
+import {
+    ExploitStateManager,
+    isCompatible,
+    getBestSuited,
+    AtracRecovery,
+    CachedSectorControlDownload,
+    FirmwareDumper,
+    ForceTOCEdit,
+    Tetris,
+    PCMFasterUpload,
+    SPUpload,
+    HiMDUSBClassOverride,
+    MonoSPUpload,
+    DisableDiscDetection,
+    EnterServiceMode,
+    ConsoleLogger,
+} from 'netmd-exploits';
 import {
     Mutex
 } from 'async-mutex';
@@ -41,7 +66,10 @@ import {
 const PROTOCOL_VERSION = '1.0';
 // Bumped whenever endpoints are added. Clients announce theirs with `/?client=N`,
 // so capabilities that need newer client code are only offered to clients that have it.
-const API_REVISION = 2;
+const API_REVISION = 3;
+
+const require = createRequire(import.meta.url);
+const encryptWorkerPath = require.resolve('netmd-js/dist/node-encrypt-worker.js');
 
 // Compatibility methods. Do NOT use these unless absolutely necessary!!
 // These have to match Web Minidisc Pro's `src/services/interfaces/netmd.ts`.
@@ -204,6 +232,8 @@ let awaitingDeviceLockMutexRelease = null;
 let device = null;
 // The disc's contents, already converted to Web Minidisc Pro's format
 let cachedContent = undefined;
+// The factory (homebrew) mode state, created on the first factory request for the connected device
+let factoryState = null;
 
 async function getCachedContent() {
     if (!cachedContent) cachedContent = convertDiscToWMD(await listContent(device));
@@ -270,7 +300,6 @@ function stringParameter(parameters, name) {
 
 async function getCapabilities(clientRevision) {
     // Mirrors NetMDUSBService.getServiceCapabilities() in Web Minidisc Pro.
-    // Factory mode isn't available over the network.
     const capabilities = ['contentList', 'playbackControl', 'fullWidthSupport'];
     const isSony = device.netMd.getVendor() === 0x54c;
     const newClient = clientRevision >= 2;
@@ -283,6 +312,15 @@ async function getCapabilities(clientRevision) {
         capabilities.push('discEject');
     }
     const deviceName = device.netMd.getDeviceName();
+    if (clientRevision >= 3 && (
+        (deviceName.includes('Sony') &&
+            (deviceName.includes('MZ-N') || deviceName.includes('MZ-S1') || deviceName.includes('MZ-RH') || deviceName.includes('MZ-DH10P') || deviceName.includes('DS-HMD1'))) ||
+        (deviceName.includes('Aiwa') && deviceName.includes('AM-NX')) ||
+        deviceName.includes('PCGA-MDN1')
+    )) {
+        // Only Sony (and Aiwa since it's the same thing) portables have the factory mode.
+        capabilities.push('factoryMode');
+    }
     if (newClient && (deviceName.includes("MZ-RH") || deviceName.includes("MZ-NH") || deviceName.includes("CMT-AH10"))) {
         capabilities.push('himdFormat');
     }
@@ -295,6 +333,41 @@ async function getCapabilities(clientRevision) {
             capabilities.push('trackUpload', 'metadataEdit');
         }
     } catch (err) {}
+    return capabilities;
+}
+
+// Enters the factory mode on first use. The state lives as long as the device stays connected.
+async function getFactory() {
+    if (!factoryState) {
+        try {
+            await device.stop();
+        } catch (ex) {}
+        const factory = await device.factory();
+        const esm = await ExploitStateManager.create(device, factory, ConsoleLogger);
+        factoryState = { factory, esm, atracDownloader: null, fasterTransferEnabled: false };
+    }
+    return factoryState;
+}
+
+// Mirrors NetMDFactoryUSBService.getExploitCapabilities() in Web Minidisc Pro.
+// The names match its `ExploitCapability` enum.
+function getExploitCapabilities(esm) {
+    const capabilities = [];
+    const bind = (exploit, name) => isCompatible(exploit, esm.device) && capabilities.push(name);
+    bind(FirmwareDumper, 'readFirmware');
+    bind(AtracRecovery, 'downloadAtrac');
+    bind(Tetris, 'runTetris');
+    bind(ForceTOCEdit, 'flushUTOC');
+    bind(PCMFasterUpload, 'spUploadSpeedup');
+    bind(SPUpload, 'uploadAtrac1');
+    bind(HiMDUSBClassOverride, 'himdFullMode');
+    bind(MonoSPUpload, 'uploadMonoSP');
+    bind(DisableDiscDetection, 'disableDiscSwapDetection');
+    bind(EnterServiceMode, 'enterServiceMode');
+    if (!esm.device.isHimd) {
+        // Non-HiMD devices can read the RAM using normal commands
+        capabilities.push('readRam');
+    }
     return capabilities;
 }
 
@@ -362,7 +435,7 @@ async function main() {
         }
         console.log(`Called ${req.url}`);
         // The WebSocket endpoints take the lock themselves, for as long as the transfer runs
-        if (req.path.startsWith("/upload") || req.path.startsWith("/download")) {
+        if (req.path.endsWith("/.websocket")) {
             next();
             return;
         }
@@ -395,6 +468,7 @@ async function main() {
                     awaitingDeviceLockMutexRelease();
                     awaitingDeviceLockMutexRelease = null;
                     console.log(`Connected to ${device.netMd.getDeviceName()}. Application resumed.`);
+                    factoryState = null;
                     flushCache();
                 }
             }
@@ -410,6 +484,7 @@ async function main() {
             mutex.release();
         }
         device = null;
+        factoryState = null;
         console.log("Device disconnected.");
         console.log("Awaiting new device...");
         flushCache();
@@ -454,6 +529,71 @@ function withLockedWebSocket(ws, handler) {
         }
         finish();
     }).catch(e => console.log(e));
+}
+
+// Runs a factory mode WebSocket transfer. Besides the throttled progress messages,
+// the handler can ask the client a question and wait for its answer, check whether
+// the client cancelled, and collect binary data sent by the client (ended by `{ end: true }`).
+// It returns `{ value, buffers }`: `value` is sent as `{ done: value, buffers: n }`,
+// followed by each of the `n` buffers as its own binary message.
+function factoryWebSocket(ws, handler) {
+    const received = [];
+    let resolveReceived, rejectReceived;
+    const allReceived = new Promise((res, rej) => {
+        resolveReceived = res;
+        rejectReceived = rej;
+    });
+    allReceived.catch(() => {});
+    let pendingAnswer = null;
+    let cancelled = false;
+    // A client that went away mid-transfer cancels it
+    ws.on('close', () => {
+        cancelled = true;
+        rejectReceived(new Error("The client disconnected."));
+        if (pendingAnswer) pendingAnswer('abort');
+        pendingAnswer = null;
+    });
+    ws.on('message', message => {
+        // Text messages are control messages, binary ones are data
+        if (typeof message !== 'string') {
+            received.push(new Uint8Array(message));
+            return;
+        }
+        const json = JSON.parse(message);
+        if (json.end) resolveReceived(received);
+        if (json.cancel) cancelled = true;
+        if ('answer' in json && pendingAnswer) {
+            const resolve = pendingAnswer;
+            pendingAnswer = null;
+            resolve(json.answer);
+        }
+    });
+
+    withLockedWebSocket(ws, async () => {
+        let lastTime = 0;
+        const context = {
+            progress(data) {
+                const newTime = new Date().getTime();
+                if (newTime - lastTime > 100) {
+                    ws.send(JSON.stringify({ progress: data }));
+                    lastTime = newTime;
+                }
+            },
+            ask(question) {
+                return new Promise(res => {
+                    pendingAnswer = res;
+                    ws.send(JSON.stringify({ question }));
+                });
+            },
+            isCancelled: () => cancelled,
+            receiveData: () => allReceived,
+        };
+        const { value = null, buffers = [] } = (await handler(context)) ?? {};
+        ws.send(JSON.stringify({ done: value, buffers: buffers.length }));
+        for (const buffer of buffers) {
+            ws.send(buffer);
+        }
+    });
 }
 
 function setup(app) {
@@ -781,6 +921,192 @@ function setup(app) {
             console.log("Download completed.");
         });
     });
+
+    // The 'factoryMode' capability (Sony portables, API revision 3):
+    // Mirrors NetMDFactoryUSBService in Web Minidisc Pro. The exploits run here, next to the device.
+
+    app.get('/factory/init', handle(async () => {
+        const { factory, esm } = await getFactory();
+        return {
+            firmware: await getDescriptiveDeviceCode(factory),
+            capabilities: getExploitCapabilities(esm),
+        };
+    }));
+
+    app.get('/factory/readUTOCSector', handle(async (parameters) => {
+        const { factory } = await getFactory();
+        return Array.from(await readUTOCSector(factory, intParameter(parameters, 'index')));
+    }));
+
+    app.post('/factory/writeUTOCSector', handle(async (_, body) => {
+        const { factory } = await getFactory();
+        if (!Array.isArray(body.data)) throw new Error("Missing parameter: data");
+        await writeUTOCSector(factory, intParameter(body, 'index'), new Uint8Array(body.data));
+    }));
+
+    app.get('/factory/flushUTOC', handle(async () => {
+        const { esm } = await getFactory();
+        flushCache();
+        await (await esm.require(ForceTOCEdit)).forceTOCEdit();
+    }));
+
+    app.get('/factory/runTetris', handle(async () => {
+        const { esm } = await getFactory();
+        await (await esm.require(Tetris)).playTetris();
+    }));
+
+    app.get('/factory/setSPSpeedupActive', handle(async (parameters) => {
+        const state = await getFactory();
+        const enable = parameters.enable === 'true';
+        if (state.fasterTransferEnabled === enable) return;
+        state.fasterTransferEnabled = enable;
+        if (enable) {
+            await state.esm.require(PCMFasterUpload);
+        } else {
+            await state.esm.unload(PCMFasterUpload);
+        }
+    }));
+
+    app.get('/factory/enableHiMDFullMode', handle(async () => {
+        const { esm } = await getFactory();
+        await esm.require(HiMDUSBClassOverride);
+    }));
+
+    app.get('/factory/enableMonoUpload', handle(async (parameters) => {
+        const { esm } = await getFactory();
+        if (parameters.enable === 'true') {
+            await esm.require(MonoSPUpload);
+        } else {
+            await esm.unload(MonoSPUpload);
+        }
+    }));
+
+    app.get('/factory/setDiscSwapDetection', handle(async (parameters) => {
+        const { esm } = await getFactory();
+        if (parameters.enable === 'true') {
+            await esm.require(DisableDiscDetection);
+        } else {
+            await esm.unload(DisableDiscDetection);
+        }
+    }));
+
+    app.get('/factory/enterServiceMode', handle(async () => {
+        const { esm } = await getFactory();
+        await esm.require(EnterServiceMode);
+    }));
+
+    // Returns whether the slower exploit was asked for, but isn't compatible with the device
+    app.get('/factory/prepareDownload', handle(async (parameters) => {
+        const state = await getFactory();
+        let useSlowerExploit = parameters.useSlowerExploit === 'true';
+        const fellBack = useSlowerExploit && !isCompatible(CachedSectorControlDownload, state.esm.device);
+        if (fellBack) useSlowerExploit = false;
+        const exploitConstructor = useSlowerExploit
+            ? CachedSectorControlDownload
+            : getBestSuited(AtracRecovery, state.esm.device);
+        state.atracDownloader = await state.esm.require(exploitConstructor);
+        return fellBack;
+    }));
+
+    app.get('/factory/finalizeDownload', handle(async () => {
+        const state = await getFactory();
+        if (state.atracDownloader) await state.esm.unload(state.atracDownloader);
+        state.atracDownloader = null;
+    }));
+
+    app.ws('/factory/readRAM', (ws) => factoryWebSocket(ws, async ({ progress }) => {
+        const { factory } = await getFactory();
+        const firmwareVersion = await getDescriptiveDeviceCode(factory);
+        const ramSize = firmwareVersion.startsWith('R') ? 0x4800 : 0x9000;
+        const readSlices = [];
+        for (let i = 0; i < ramSize; i += 0x10) {
+            readSlices.push(await cleanRead(factory, i + 0x02000000, 0x10, MemoryType.MAPPED));
+            progress({ readBytes: i, totalBytes: ramSize });
+        }
+        return { buffers: [Buffer.concat(readSlices)] };
+    }));
+
+    app.ws('/factory/readFirmware', (ws) => factoryWebSocket(ws, async ({ progress }) => {
+        const { esm } = await getFactory();
+        const firmwareRipper = await esm.require(FirmwareDumper);
+        const { rom, ram, dram } = await firmwareRipper.readFirmware(progress);
+        const parts = dram ? { rom, ram, dram } : { rom, ram };
+        return { value: Object.keys(parts), buffers: Object.values(parts) };
+    }));
+
+    app.ws('/factory/downloadTrack', (ws, req) => factoryWebSocket(ws, async ({ progress, ask, isCancelled }) => {
+        const { atracDownloader } = await getFactory();
+        if (!atracDownloader) throw new Error("You need to call /factory/prepareDownload first");
+        const track = intParameter(req.query, 'track');
+        const config = {
+            ...JSON.parse(req.query.config ?? '{}'),
+            shouldCancelImmediately: isCancelled,
+            handleBadSector: async (address, count, seconds) => {
+                console.log(`Bad sector at ${address} (DRAM sector ${count}, ${seconds.toFixed(2)}s), asking the client...`);
+                const answer = await ask({ badSector: { address, count, seconds } });
+                console.log(`Bad sector at ${address}: the client chose '${answer}'.`);
+                return answer;
+            },
+        };
+        if (req.query.neraw === 'true') {
+            const data = await atracDownloader.downloadTrackWithMarkers(track, progress, {
+                ...config,
+                includeMetadataSection: true,
+                removeLPBytes: 'never',
+            });
+            return { value: { extension: 'neraw' }, buffers: [data] };
+        }
+        const { data, extension } = await atracDownloader.downloadTrack(track, progress, config);
+        return { value: { extension }, buffers: [data] };
+    }));
+
+    // SP (ATRAC1) uploads. The client sends the raw ATRAC data; it's reshaped by the exploit, then encrypted here.
+    app.ws('/factory/uploadSP', (ws, req) => factoryWebSocket(ws, async ({ progress, receiveData }) => {
+        const state = await getFactory();
+        const { esm } = state;
+        const { title = '', fullWidthTitle = '' } = req.query;
+        const mono = req.query.mono === 'true';
+        const data = Buffer.concat(await receiveData());
+        if (!session) throw new Error("The upload session hasn't been prepared.");
+
+        // The patch memory is too small to accomodate for both ATRAC1Upload and PCMFasterUpload.
+        if (state.fasterTransferEnabled) {
+            await esm.unload(PCMFasterUpload);
+        }
+
+        let total = data.byteLength;
+        let written = 0;
+        let encrypted = 0;
+        const worker = new Worker(encryptWorkerPath);
+        const packetIterator = makeGetAsyncPacketIteratorOnWorkerThread(worker, ({ encryptedBytes }) => {
+            encrypted = encryptedBytes;
+            progress({ written, encrypted, total });
+        });
+
+        let mdTrack = new MDTrack(sanitizeHalfWidthTitle(title), Wireformat.l105kbps,
+            data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength), 0x400,
+            sanitizeFullWidthTitle(fullWidthTitle), packetIterator);
+        let index = -1;
+        try {
+            await esm.envelop(SPUpload, mono ? 1 : 2, async spUpload => {
+                mdTrack = spUpload.prepareTrack(mdTrack);
+                total = mdTrack.data.byteLength;
+                [index] = await session.downloadTrack(mdTrack, ({ writtenBytes }) => {
+                    written = writtenBytes;
+                    progress({ written, encrypted, total });
+                });
+            });
+        } finally {
+            worker.terminate();
+            flushCache();
+        }
+
+        if (state.fasterTransferEnabled) {
+            await esm.require(PCMFasterUpload);
+        }
+        console.log("SP upload completed.");
+        return { value: index };
+    }));
 
     app.get('/upload', handle(() => { throw new Error("This is a WebSocket-only endpoint."); }));
     app.get('/download', handle(() => { throw new Error("This is a WebSocket-only endpoint."); }));
