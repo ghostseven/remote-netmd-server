@@ -250,6 +250,21 @@ function sleep(ms) {
     });
 }
 
+// Some devices (e.g. the MDS-JE780) occasionally answer status queries with malformed replies while
+// they're still busy, for example right after an upload. netmd-js gives up on those, so retry a few
+// times. They happen before anything is written to the disc.
+async function prepareDownloadWithRetries() {
+    for (let attempt = 1; ; attempt++) {
+        try {
+            return await prepareDownload(device);
+        } catch (ex) {
+            if (attempt >= 5 || !errorMessage(ex).startsWith('Format and input mismatch')) throw ex;
+            console.log(`Malformed reply while preparing the upload, retrying: ${errorMessage(ex)}`);
+            await sleep(1000);
+        }
+    }
+}
+
 function errorMessage(error) {
     return error instanceof Error ? error.message : String(error);
 }
@@ -816,7 +831,7 @@ function setup(app) {
 
     let session = null;
     app.get('/prepareUpload', handle(async () => {
-        await prepareDownload(device);
+        await prepareDownloadWithRetries();
         session = new MDSession(device);
         await session.init();
     }));
