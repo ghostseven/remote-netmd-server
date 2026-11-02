@@ -39,7 +39,6 @@ import {
     getDescriptiveDeviceCode,
     cleanRead,
     MemoryType,
-    NetMDFactoryInterface,
 } from 'netmd-js';
 import { makeGetAsyncPacketIteratorOnWorkerThread } from 'netmd-js/dist/node-encrypt-worker.js';
 import {
@@ -352,17 +351,6 @@ async function getCapabilities(clientRevision) {
     return capabilities;
 }
 
-// Sony's NetMD decks (MDS-JB980/MDS-JE780/MDS-NT1) never answer the factory "login" that
-// netmd-js sends first, which left the request hanging. Like netmd++ (NetMD Wizard), skip it there.
-async function openFactory() {
-    const { netMd } = device;
-    if (netMd.getVendor() === 0x54c && netMd.getProduct() === 0x0081) {
-        await device.getNetMDLevel(); // Reads the disc subunit identifier, as device.factory() does
-        return new NetMDFactoryInterface(netMd, netmdLogger);
-    }
-    return device.factory();
-}
-
 // Enters the factory mode on first use. The state lives as long as the device stays connected.
 async function getFactory() {
     if (!factoryState) {
@@ -374,7 +362,7 @@ async function getFactory() {
         const { netMd } = device;
         const readBulkToArray = netMd.readBulkToArray.bind(netMd);
         netMd.readBulkToArray = (length, chunksize, callback) => readBulkToArray(length, Math.min(chunksize ?? 0x10000, 0x10000), callback);
-        const factory = await openFactory();
+        const factory = await device.factory();
         const esm = await ExploitStateManager.create(device, factory, ConsoleLogger);
         factoryState = { factory, esm, atracDownloader: null, fasterTransferEnabled: false };
     }
