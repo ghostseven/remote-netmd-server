@@ -410,6 +410,10 @@ async function main() {
             type: "number",
             describe: "The port on which to host",
         })
+        .option("debug", {
+            type: "boolean",
+            describe: "Log every command sent to the device and every reply",
+        })
         .default("port", 11396)
         .default("https", true)
         .default("httpsCert", "cert.pem")
@@ -421,8 +425,10 @@ async function main() {
         port,
         https: useHttps,
         httpsCert,
-        httpsKey
+        httpsKey,
+        debug,
     } = args;
+    if (debug) netmdLogger.debug = console.log;
     // ********************** Express initialization *********************
     const app = express();
     const server = useHttps ? https.createServer({
